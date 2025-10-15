@@ -1,0 +1,66 @@
+# PostgreSQL Database Configuration
+databases:
+  # Source (Unencrypted) Database - airbyte database
+  - name: "source-db
+    host: "testing-rds-source.ap-southeast-1.rds.amazonaws.com"
+    port: 5432
+    user: "root"
+    password: "yourpass"
+    dbname: "airbyte"
+    role: "source"
+    
+  # Target (Encrypted) Database - airbyte database
+  - name: "target-db"
+    host: "testing-rds-target.ap-southeast-1.rds.amazonaws.com"
+    port: 5432
+    user: "root"
+    password: "yourpass"
+    dbname: "airbyte"
+    role: "target"
+  
+  # Add more databases from the same instance if needed
+  # Example: If you have another database called "myapp" on the same RDS instance
+  # - name: "source-db-myapp"
+  #   host: "testing-rds-extrnldbdev..ap-southeast-1.rds.amazonaws.com"
+  #   port: 5432
+  #   user: "root"
+  #   password: "yourpass"
+  #   dbname: "myapp"
+  #   role: "source"
+  #   
+  # - name: "target-db-myapp"
+  #   host: "testing-rds-externldbdev-replica..ap-southeast-1.rds.amazonaws.com"
+  #   port: 5432
+  #   user: "root"
+  #   password: "yourpass"
+  #   dbname: "myapp"
+  #   role: "target"
+  #
+  # Example: Another database called "analytics"
+  # - name: "source-db-analytics"
+  #   host: "testing-rds-extrnldbdev..ap-southeast-1.rds.amazonaws.com"
+  #   port: 5432
+  #   user: "root"
+  #   password: "yourpass"
+  #   dbname: "analytics"
+  #   role: "source"
+  #   
+  # - name: "target-db-analytics"
+  #   host: "testing-rds-externldbdev-replica..ap-southeast-1.rds.amazonaws.com"
+  #   port: 5432
+  #   user: "root"
+  #   password: "yourpass"
+  #   dbname: "analytics"
+  #   role: "target"
+
+# Web Server Configuration
+server:
+  port: 8080
+  refresh_interval: 5  # seconds
+
+# Monitoring Configuration
+monitoring:
+  # Alert when replication lag exceeds this value (in bytes)
+  lag_threshold: 1048576  # 1MB
+  # Alert when replication is inactive for this duration (in seconds)
+  inactive_threshold: 60
