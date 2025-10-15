@@ -1,7 +1,7 @@
 # PostgreSQL Replication Monitor
 
 A real-time monitoring dashboard for PostgreSQL logical replication, designed to track the progress of database encryption migration with minimal downtime.
-https://raw.githubusercontent.com/ariretiarno/postgresql-replication-monitor/refs/heads/main/image/image.png
+![alt text](https://raw.githubusercontent.com/ariretiarno/postgresql-replication-monitor/refs/heads/main/image/image.png)
 
 ## Overview
 
