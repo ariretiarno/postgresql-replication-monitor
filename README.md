@@ -1,264 +1,239 @@
 # PostgreSQL Replication Monitor
 
-A real-time monitoring dashboard for PostgreSQL logical replication, designed to track the progress of database encryption migration with minimal downtime.
-![alt text](https://raw.githubusercontent.com/ariretiarno/postgresql-replication-monitor/refs/heads/main/image/image.png)
+A comprehensive monitoring solution for PostgreSQL logical replication using publication/subscription. Built with Go backend and React frontend with real-time monitoring capabilities.
 
-## Overview
+## Features
 
-This application monitors PostgreSQL logical replication during the process of encrypting an RDS database as described in the [AWS Database Blog](https://aws.amazon.com/blogs/database/encrypt-amazon-rds-for-postgresql-and-amazon-aurora-postgresql-database-with-minimal-downtime/).
+- **Real-time LSN Monitoring**: Track Log Sequence Numbers and bytes on both source and target databases
+- **Replication Lag Tracking**: Monitor write, flush, and replay lags
+- **Publication Management**: View all publications and their configurations
+- **Subscription Management**: Monitor active subscriptions and their status
+- **Replication Slots**: Track replication slot status and WAL retention
+- **Data Discrepancy Check**: Compare row counts between source and target databases
+- **Beautiful Dashboard**: Modern, responsive UI with dark theme
+- **Auto-refresh**: Real-time updates every 5-10 seconds
 
-### Features
+## Architecture
 
-- **Real-time Monitoring**: WebSocket-based live updates
-- **Multi-Database Support**: Monitor multiple publications and subscriptions across databases
-- **LSN Tracking**: Track Log Sequence Numbers (LSN) and replication lag
-- **Replication Statistics**: Monitor replication slots, publications, and subscriptions
-- **Health Monitoring**: Automatic health checks with configurable thresholds
-- **Modern Dashboard**: Clean, responsive UI with real-time metrics
-
-## Monitored Metrics
-
-### Source Database (Unencrypted)
-- Publications and their tables
-- Replication slots status
-- Current WAL LSN
-- Confirmed flush LSN
-- LSN distance (replication lag in bytes)
-- Replication slot activity
-
-### Target Database (Encrypted)
-- Subscriptions status
-- Received LSN
-- Last message timestamps
-- Subscription activity
-
-### Overall Health
-- Total publications and subscriptions
-- Active vs inactive replication slots
-- Maximum replication lag (bytes and seconds)
-- System health status (healthy/warning/critical)
+- **Monolithic Go Application**: Single binary with embedded HTML/CSS/JS
+- **Frontend**: Vanilla JavaScript with TailwindCSS CDN
+- **Database**: PostgreSQL (supports both encrypted and unencrypted instances)
 
 ## Prerequisites
 
-- Go 1.21 or later
-- PostgreSQL 10+ with logical replication enabled
-- Network access to both source and target databases
+- Go 1.21 or higher
+- PostgreSQL 12 or higher with logical replication enabled
+- Two PostgreSQL instances (source and target)
 
 ## Installation
 
-1. Clone the repository:
+### 1. Clone or navigate to the project directory
+
 ```bash
-git clone <repository-url>
-cd monitoring-replication
+cd /Users/ariretiarno/CascadeProjects/pg-replication-monitor
 ```
 
-2. Install dependencies:
+### 2. Configure environment variables
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your database credentials:
+
+```env
+# Source Database (Unencrypted)
+SOURCE_DB_HOST=your-source-host
+SOURCE_DB_PORT=5432
+SOURCE_DB_USER=postgres
+SOURCE_DB_PASSWORD=your-password
+SOURCE_DB_NAME=postgres
+SOURCE_DB_SSLMODE=disable
+
+# Target Database (Encrypted)
+TARGET_DB_HOST=your-target-host
+TARGET_DB_PORT=5432
+TARGET_DB_USER=postgres
+TARGET_DB_PASSWORD=your-password
+TARGET_DB_NAME=postgres
+TARGET_DB_SSLMODE=require
+
+# Server Configuration
+SERVER_PORT=8080
+```
+
+### 3. Install Go dependencies and run
+
 ```bash
 go mod download
+go run main.go
 ```
 
-3. Configure your databases:
-```bash
-cp config.yaml config.yaml.local
-# Edit config.yaml.local with your database credentials
-```
+The application will be available at `http://localhost:8080`
 
-## Configuration
-
-Edit `config.yaml` with your database connection details:
-
-```yaml
-databases:
-  - name: "source-db"
-    host: "source-db.region.rds.amazonaws.com"
-    port: 5432
-    user: "postgres"
-    password: "your-password"
-    dbname: "postgres"
-    role: "source"
-    
-  - name: "target-db"
-    host: "target-db.region.rds.amazonaws.com"
-    port: 5432
-    user: "postgres"
-    password: "your-password"
-    dbname: "postgres"
-    role: "target"
-
-server:
-  port: 8080
-  refresh_interval: 5  # seconds
-
-monitoring:
-  lag_threshold: 1048576  # 1MB in bytes
-  inactive_threshold: 60  # seconds
-```
-
-### Configuration Options
-
-- **databases**: Array of database configurations
-  - `name`: Friendly name for the database
-  - `host`: Database hostname
-  - `port`: Database port (default: 5432)
-  - `user`: Database user
-  - `password`: Database password
-  - `dbname`: Database name to connect to
-  - `role`: Either "source" or "target"
-
-- **server**: Web server configuration
-  - `port`: HTTP server port
-  - `refresh_interval`: How often to refresh metrics (in seconds)
-
-- **monitoring**: Alert thresholds
-  - `lag_threshold`: Alert when replication lag exceeds this value (bytes)
-  - `inactive_threshold`: Alert when replication is inactive for this duration (seconds)
-
-## Usage
-
-### Running the Monitor
+## Development Mode
 
 ```bash
-# Using default config.yaml
-go run cmd/monitor/main.go
-
-# Using custom config file
-go run cmd/monitor/main.go -config config.yaml.local
+go run main.go
 ```
 
-### Building the Binary
-
-```bash
-go build -o bin/monitor cmd/monitor/main.go
-./bin/monitor -config config.yaml
-```
-
-### Accessing the Dashboard
-
-Once running, open your browser to:
-```
-http://localhost:8080
-```
-
-The dashboard will automatically connect via WebSocket and display real-time updates.
-
-## Dashboard Features
-
-### Summary Cards
-- **Publications**: Total number of publications on source database
-- **Subscriptions**: Total number of subscriptions on target database
-- **Replication Slots**: Active/Total replication slots
-- **Max Lag**: Maximum replication lag across all slots
-
-### Health Status
-- Overall system health (Healthy/Warning/Critical)
-- List of current issues and alerts
-
-### Database Details
-For each database, the dashboard shows:
-- Connection status
-- Current LSN
-- Publications (source only)
-- Replication slots (source only)
-- Replication statistics with LSN distance
-- Subscriptions (target only)
-- Subscription statistics
-
-## Monitoring During Encryption Migration
-
-### Pre-Migration
-1. Configure both source and target databases in `config.yaml`
-2. Start the monitor before beginning the migration
-3. Verify all databases are connected
-
-### During Migration
-1. Monitor the LSN distance to track replication progress
-2. Watch for the LSN distance to approach zero
-3. Check for any inactive replication slots
-4. Monitor for alerts about high lag
-
-### Cutover Decision
-The dashboard helps you decide when to cutover by showing:
-- LSN distance = 0 (replication is caught up)
-- All replication slots are active
-- No health warnings or critical issues
-
-### Post-Migration
-- Continue monitoring to ensure replication remains healthy
-- Verify subscription statistics on the target database
+The server will automatically serve the HTML/JS files.
 
 ## API Endpoints
 
-### REST API
-- `GET /api/snapshot`: Get current monitoring snapshot (JSON)
+- `GET /api/health` - Health check
+- `GET /api/summary` - Overall monitoring summary
+- `GET /api/lsn/source` - Source database LSN information
+- `GET /api/lsn/target` - Target database LSN information
+- `GET /api/publications` - List all publications
+- `GET /api/subscriptions` - List all subscriptions
+- `GET /api/replication-slots` - List all replication slots
+- `GET /api/replication-stats` - Replication statistics
+- `GET /api/databases` - List all databases
+- `POST /api/discrepancy-check` - Check data discrepancies
 
-### WebSocket
-- `WS /api/ws`: Real-time monitoring updates
+## PostgreSQL Setup
+
+### Source Database (Unencrypted)
+
+1. Enable logical replication:
+```sql
+ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
+```
+
+2. Restart PostgreSQL
+
+3. Create publication:
+```sql
+-- For all tables in a database
+CREATE PUBLICATION my_publication FOR ALL TABLES;
+
+-- Or for specific tables
+CREATE PUBLICATION my_publication FOR TABLE table1, table2;
+```
+
+### Target Database (Encrypted)
+
+1. Create subscription:
+```sql
+CREATE SUBSCRIPTION my_subscription
+CONNECTION 'host=source-host port=5432 dbname=mydb user=postgres password=xxx'
+PUBLICATION my_publication;
+```
+
+2. Check subscription status:
+```sql
+SELECT * FROM pg_subscription;
+SELECT * FROM pg_stat_subscription;
+```
+
+## Monitoring Metrics
+
+### LSN (Log Sequence Number)
+- **Current LSN**: Current write position in WAL
+- **LSN Bytes**: Total bytes written
+- **Replication Lag**: Difference between source and target LSN
+
+### Replication Stats
+- **Write Lag**: Time taken to write WAL to disk
+- **Flush Lag**: Time taken to flush WAL to disk
+- **Replay Lag**: Time taken to apply changes
+
+### Health Status
+- **Healthy**: All slots active, minimal lag
+- **Warning**: Some slots inactive or moderate lag
+- **Critical**: No active slots or high lag
 
 ## Troubleshooting
 
 ### Connection Issues
-- Verify database credentials in config.yaml
-- Ensure security groups allow connections from the monitoring server
-- Check that `rds.logical_replication` is enabled on both databases
+- Verify database credentials in `.env`
+- Check PostgreSQL `pg_hba.conf` for connection permissions
+- Ensure network connectivity between monitoring server and databases
 
 ### No Replication Data
-- Verify publications are created on the source database
-- Verify subscriptions are created on the target database
-- Check that replication slots exist and are active
-
-### High Lag
-- Check network connectivity between databases
-- Verify target database has sufficient resources
+- Verify publications exist on source database
+- Verify subscriptions exist on target database
+- Check replication slots are active
 - Review PostgreSQL logs for errors
 
-## SQL Queries Used
+### High Replication Lag
+- Check network latency between source and target
+- Monitor disk I/O on target database
+- Verify target database has sufficient resources
+- Check for long-running transactions
 
-The monitor uses these PostgreSQL queries:
+## Production Deployment
 
-### Replication Slots
-```sql
-SELECT slot_name, confirmed_flush_lsn, active,
-       (pg_current_wal_lsn() - confirmed_flush_lsn) AS lsn_distance
-FROM pg_replication_slots
-WHERE slot_type = 'logical';
+### Using Docker (Optional)
+
+Create a `Dockerfile`:
+```dockerfile
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN go build -o monitor main.go
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/monitor .
+COPY --from=builder /app/index.html .
+COPY --from=builder /app/static ./static
+EXPOSE 8080
+CMD ["./monitor"]
 ```
 
-### Publications
-```sql
-SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete
-FROM pg_publication;
+Build and run:
+```bash
+docker build -t pg-replication-monitor .
+docker run -p 8080:8080 --env-file .env pg-replication-monitor
 ```
 
-### Subscriptions
-```sql
-SELECT subname, subenabled, subpublications, subslotname
-FROM pg_subscription;
+### Systemd Service
+
+Create `/etc/systemd/system/pg-monitor.service`:
+```ini
+[Unit]
+Description=PostgreSQL Replication Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=postgres
+WorkingDirectory=/opt/pg-replication-monitor
+ExecStart=/opt/pg-replication-monitor/monitor
+Restart=on-failure
+EnvironmentFile=/opt/pg-replication-monitor/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl enable pg-monitor
+sudo systemctl start pg-monitor
 ```
 
 ## Security Considerations
 
-- Store database passwords securely (use environment variables or secrets management)
-- Use SSL/TLS connections to databases (`sslmode=require`)
-- Restrict network access to the monitoring dashboard
-- Consider using IAM authentication for RDS databases
-
-## Performance
-
-- Minimal overhead: Queries run every 5 seconds (configurable)
-- Efficient connection pooling
-- Parallel data collection from multiple databases
-- WebSocket for efficient real-time updates
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
+- Use strong passwords for database connections
+- Enable SSL/TLS for database connections in production
+- Restrict network access to monitoring server
+- Use read-only database users for monitoring
+- Keep `.env` file secure and never commit to version control
 
 ## License
 
 MIT License
 
-## References
+## Support
 
-- [AWS Blog: Encrypt Amazon RDS for PostgreSQL with minimal downtime](https://aws.amazon.com/blogs/database/encrypt-amazon-rds-for-postgresql-and-amazon-aurora-postgresql-database-with-minimal-downtime/)
-- [PostgreSQL Logical Replication Documentation](https://www.postgresql.org/docs/current/logical-replication.html)
-- [PostgreSQL Replication Slots](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html)
+For issues and questions, please refer to the PostgreSQL documentation:
+- [Logical Replication](https://www.postgresql.org/docs/current/logical-replication.html)
+- [Publications](https://www.postgresql.org/docs/current/sql-createpublication.html)
+- [Subscriptions](https://www.postgresql.org/docs/current/sql-createsubscription.html)
