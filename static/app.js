@@ -466,28 +466,105 @@ async function loadAllDatabases() {
     }
 }
 
+let discoveredTables = [];
+let batchPollInterval = null;
+
 async function loadDiscrepancyCheck() {
     try {
         const databases = await fetch('/api/databases').then(r => r.json());
-        
+
         document.getElementById('tabContent').innerHTML = `
             <div class="space-y-6">
                 <h2 class="text-2xl font-bold">Data Discrepancy Check</h2>
+
+                <!-- Batch Check All Databases -->
                 <div class="bg-slate-800/50 card border border-slate-700 rounded-lg p-6">
+                    <h3 class="text-lg font-semibold mb-3 flex items-center">
+                        <svg class="h-5 w-5 mr-2 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+                        </svg>
+                        Batch Check All Databases
+                    </h3>
+                    <p class="text-slate-400 text-sm mb-4">Auto-discovers all tables in every replicated database and compares row counts between source and target.</p>
+                    <div class="flex items-center space-x-4 mb-4">
+                        <label class="flex items-center space-x-2 cursor-pointer">
+                            <input type="checkbox" id="batchUseEstimate" class="rounded bg-slate-700 border-slate-600">
+                            <span class="text-sm">Use estimated counts (fast, from pg_stat_user_tables)</span>
+                        </label>
+                    </div>
+                    <button onclick="startBatchCheck()" id="batchCheckBtn" class="px-6 py-3 bg-orange-600 hover:bg-orange-700 rounded-lg font-semibold w-full">
+                        Check All Databases
+                    </button>
+                    <div id="batchProgress" class="mt-4 hidden">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-sm text-slate-400">Progress</span>
+                            <span id="batchProgressText" class="text-sm font-mono">0 / 0</span>
+                        </div>
+                        <div class="w-full bg-slate-700 rounded-full h-3">
+                            <div id="batchProgressBar" class="bg-orange-500 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="batchResults"></div>
+
+                <hr class="border-slate-700">
+
+                <!-- Single Database Check -->
+                <div class="bg-slate-800/50 card border border-slate-700 rounded-lg p-6">
+                    <h3 class="text-lg font-semibold mb-3 flex items-center">
+                        <svg class="h-5 w-5 mr-2 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/>
+                        </svg>
+                        Single Database Check
+                    </h3>
                     <div class="space-y-4">
                         <div>
                             <label class="block text-sm font-medium mb-2">Select Database</label>
-                            <select id="dbSelect" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
-                                <option value="">Choose a database...</option>
-                                ${databases.map(db => `<option value="${db.name}">${db.name} (${db.size})</option>`).join('')}
-                            </select>
+                            <div class="flex space-x-2">
+                                <select id="dbSelect" class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
+                                    <option value="">Choose a database...</option>
+                                    ${databases.map(db => `<option value="${db.name}">${db.name} (${db.size})</option>`).join('')}
+                                </select>
+                                <button onclick="loadTablesForDb()" class="px-4 py-2 bg-slate-600 hover:bg-slate-500 rounded-lg text-sm font-medium whitespace-nowrap">
+                                    Load Tables
+                                </button>
+                            </div>
+                        </div>
+                        <div id="tableListContainer" class="hidden">
+                            <div class="flex items-center justify-between mb-2">
+                                <label class="block text-sm font-medium">Tables</label>
+                                <div class="flex space-x-2">
+                                    <button onclick="toggleAllTables(true)" class="text-xs px-2 py-1 bg-slate-600 hover:bg-slate-500 rounded">Select All</button>
+                                    <button onclick="toggleAllTables(false)" class="text-xs px-2 py-1 bg-slate-600 hover:bg-slate-500 rounded">Deselect All</button>
+                                </div>
+                            </div>
+                            <div id="tableCheckboxes" class="max-h-64 overflow-y-auto bg-slate-900/50 rounded-lg p-3 space-y-1"></div>
+                            <div id="tableSummary" class="mt-2 text-sm text-slate-400"></div>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium mb-2">Table Names (comma-separated)</label>
+                            <label class="block text-sm font-medium mb-2">Or enter table names manually (comma-separated)</label>
                             <input type="text" id="tableInput" placeholder="e.g., users, orders, products" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
-                            <p class="text-slate-400 text-sm mt-1">Enter table names separated by commas</p>
                         </div>
-                        <button onclick="checkDiscrepancy()" class="w-full px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg">Check Discrepancy</button>
+                        <div class="flex items-center space-x-4">
+                            <label class="flex items-center space-x-2 cursor-pointer">
+                                <input type="checkbox" id="singleUseEstimate" class="rounded bg-slate-700 border-slate-600">
+                                <span class="text-sm">Use estimated counts (fast)</span>
+                            </label>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <button onclick="runSingleCheck()" class="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold">
+                                Check Row Counts
+                            </button>
+                            <button onclick="runChecksumCheck()" class="px-6 py-3 bg-purple-600 hover:bg-purple-700 rounded-lg font-semibold">
+                                Deep Checksum Validation
+                            </button>
+                        </div>
+                        <div class="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3">
+                            <p class="text-yellow-400 text-xs">
+                                <strong>Checksum validation</strong> computes MD5 of all row data ordered by primary key. 
+                                This is resource-intensive for large tables (~40GB). Use on specific tables you suspect have issues.
+                            </p>
+                        </div>
                     </div>
                 </div>
                 <div id="discrepancyResults"></div>
@@ -498,43 +575,375 @@ async function loadDiscrepancyCheck() {
     }
 }
 
-async function checkDiscrepancy() {
+async function loadTablesForDb() {
     const database = document.getElementById('dbSelect').value;
-    const tables = document.getElementById('tableInput').value;
-    
-    if (!database || !tables) {
-        alert('Please select a database and enter table names');
+    if (!database) { alert('Please select a database first'); return; }
+
+    const container = document.getElementById('tableCheckboxes');
+    container.innerHTML = '<div class="text-slate-400 text-sm animate-pulse">Loading tables...</div>';
+    document.getElementById('tableListContainer').classList.remove('hidden');
+
+    try {
+        const resp = await fetch(`/api/tables?database=${encodeURIComponent(database)}`);
+        const data = await resp.json();
+
+        const allTables = new Map();
+        (data.source_tables || []).forEach(t => {
+            const key = t.schema_name + '.' + t.table_name;
+            allTables.set(key, { ...t, onSource: true, onTarget: false, sourceEst: t.est_rows, targetEst: 0 });
+        });
+        (data.target_tables || []).forEach(t => {
+            const key = t.schema_name + '.' + t.table_name;
+            if (allTables.has(key)) {
+                const existing = allTables.get(key);
+                existing.onTarget = true;
+                existing.targetEst = t.est_rows;
+            } else {
+                allTables.set(key, { schema_name: t.schema_name, table_name: t.table_name, onSource: false, onTarget: true, sourceEst: 0, targetEst: t.est_rows });
+            }
+        });
+
+        discoveredTables = Array.from(allTables.entries());
+
+        if (discoveredTables.length === 0) {
+            container.innerHTML = '<div class="text-slate-400 text-sm">No tables found in this database.</div>';
+            return;
+        }
+
+        container.innerHTML = discoveredTables.map(([key, t]) => {
+            let badge = '';
+            if (!t.onTarget) badge = '<span class="px-1.5 py-0.5 bg-red-500/20 text-red-400 text-xs rounded ml-2">Missing on Target</span>';
+            else if (!t.onSource) badge = '<span class="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded ml-2">Missing on Source</span>';
+            return `
+                <label class="flex items-center space-x-2 py-1 px-2 hover:bg-slate-800 rounded cursor-pointer">
+                    <input type="checkbox" class="table-cb rounded bg-slate-700 border-slate-600" value="${key}" checked>
+                    <span class="text-sm font-mono">${key}</span>
+                    <span class="text-xs text-slate-500 ml-auto">~${t.sourceEst.toLocaleString()} / ~${t.targetEst.toLocaleString()} rows</span>
+                    ${badge}
+                </label>
+            `;
+        }).join('');
+
+        document.getElementById('tableSummary').textContent =
+            `${discoveredTables.length} tables found (${(data.source_tables||[]).length} source, ${(data.target_tables||[]).length} target)`;
+
+        if (data.error) {
+            document.getElementById('tableSummary').innerHTML += `<br><span class="text-yellow-400">${data.error}</span>`;
+        }
+    } catch (error) {
+        container.innerHTML = `<div class="text-red-400 text-sm">Error: ${error.message}</div>`;
+    }
+}
+
+function toggleAllTables(checked) {
+    document.querySelectorAll('.table-cb').forEach(cb => cb.checked = checked);
+}
+
+function getSelectedTables() {
+    const checked = Array.from(document.querySelectorAll('.table-cb:checked')).map(cb => cb.value);
+    const manual = (document.getElementById('tableInput').value || '').split(',').map(t => t.trim()).filter(t => t);
+    const all = [...new Set([...checked, ...manual])];
+    return all;
+}
+
+async function runSingleCheck() {
+    const database = document.getElementById('dbSelect').value;
+    const tables = getSelectedTables();
+    const useEstimate = document.getElementById('singleUseEstimate').checked;
+
+    if (!database || tables.length === 0) {
+        alert('Please select a database and at least one table');
         return;
     }
 
-    const tableList = tables.split(',').map(t => t.trim()).filter(t => t);
-    
+    const resultsDiv = document.getElementById('discrepancyResults');
+    resultsDiv.innerHTML = '<div class="text-slate-400 animate-pulse p-4">Checking row counts...</div>';
+
     try {
         const response = await fetch('/api/discrepancy-check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ database, tables: tableList })
+            body: JSON.stringify({ database, tables, use_estimate: useEstimate })
         });
         const results = await response.json();
-        
-        document.getElementById('discrepancyResults').innerHTML = `
-            <h3 class="text-xl font-semibold mb-4">Results</h3>
-            ${results.map(result => `
-                <div class="bg-slate-800/50 card border ${result.has_discrepancy ? 'border-red-500' : 'border-green-500'} rounded-lg p-6 mb-4">
-                    <div class="flex justify-between mb-4">
-                        <div><h4 class="text-lg font-semibold">${result.table_name}</h4><p class="text-sm text-slate-400">${result.database}</p></div>
-                        ${result.has_discrepancy ? '<span class="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-sm">Discrepancy Found</span>' : '<span class="px-3 py-1 bg-green-500/20 text-green-400 rounded-full text-sm">In Sync</span>'}
+        renderSingleResults(results, useEstimate);
+    } catch (error) {
+        resultsDiv.innerHTML = `<div class="text-red-400 p-4">Error: ${error.message}</div>`;
+    }
+}
+
+function renderSingleResults(results, useEstimate) {
+    const discrepancies = results.filter(r => r.has_discrepancy);
+    const resultsDiv = document.getElementById('discrepancyResults');
+
+    resultsDiv.innerHTML = `
+        <div class="bg-slate-800/50 card border border-slate-700 rounded-lg p-4 mb-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                    <span class="text-lg font-semibold">${results.length} tables checked</span>
+                    ${useEstimate ? '<span class="px-2 py-1 bg-yellow-500/20 text-yellow-400 text-xs rounded">Estimated</span>' : '<span class="px-2 py-1 bg-blue-500/20 text-blue-400 text-xs rounded">Exact</span>'}
+                </div>
+                <div class="flex items-center space-x-3">
+                    <span class="px-3 py-1 bg-green-500/20 text-green-400 rounded-full text-sm">${results.length - discrepancies.length} in sync</span>
+                    ${discrepancies.length > 0 ? `<span class="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-sm">${discrepancies.length} discrepancies</span>` : ''}
+                </div>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-slate-700">
+                        <th class="text-left py-3 px-4 text-slate-400 font-medium">Table</th>
+                        <th class="text-right py-3 px-4 text-slate-400 font-medium">Source Count</th>
+                        <th class="text-right py-3 px-4 text-slate-400 font-medium">Target Count</th>
+                        <th class="text-right py-3 px-4 text-slate-400 font-medium">Difference</th>
+                        <th class="text-center py-3 px-4 text-slate-400 font-medium">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${results.map(r => `
+                        <tr class="border-b border-slate-800 hover:bg-slate-800/50 ${r.has_discrepancy ? 'bg-red-500/5' : ''}">
+                            <td class="py-3 px-4 font-mono text-sm">${r.table_name}</td>
+                            <td class="py-3 px-4 text-right font-mono">${r.source_count.toLocaleString()}</td>
+                            <td class="py-3 px-4 text-right font-mono">${r.target_count.toLocaleString()}</td>
+                            <td class="py-3 px-4 text-right font-mono ${r.has_discrepancy ? 'text-red-400 font-bold' : 'text-green-400'}">${r.discrepancy > 0 ? '+' : ''}${r.discrepancy.toLocaleString()}</td>
+                            <td class="py-3 px-4 text-center">${r.has_discrepancy
+                                ? '<span class="px-2 py-1 bg-red-500/20 text-red-400 rounded text-xs">MISMATCH</span>'
+                                : '<span class="px-2 py-1 bg-green-500/20 text-green-400 rounded text-xs">OK</span>'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+async function runChecksumCheck() {
+    const database = document.getElementById('dbSelect').value;
+    const tables = getSelectedTables();
+
+    if (!database || tables.length === 0) {
+        alert('Please select a database and at least one table');
+        return;
+    }
+
+    if (tables.length > 10) {
+        if (!confirm(`You selected ${tables.length} tables for checksum validation. This may take a long time for large tables. Continue?`)) return;
+    }
+
+    const resultsDiv = document.getElementById('discrepancyResults');
+    resultsDiv.innerHTML = '<div class="text-slate-400 animate-pulse p-4">Computing checksums... This may take a while for large tables.</div>';
+
+    try {
+        const response = await fetch('/api/checksum-check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ database, tables })
+        });
+        const results = await response.json();
+        renderChecksumResults(results);
+    } catch (error) {
+        resultsDiv.innerHTML = `<div class="text-red-400 p-4">Error: ${error.message}</div>`;
+    }
+}
+
+function renderChecksumResults(results) {
+    const mismatches = results.filter(r => !r.match && !r.error);
+    const errors = results.filter(r => r.error);
+    const resultsDiv = document.getElementById('discrepancyResults');
+
+    resultsDiv.innerHTML = `
+        <div class="bg-slate-800/50 card border border-slate-700 rounded-lg p-4 mb-4">
+            <div class="flex items-center justify-between">
+                <span class="text-lg font-semibold">${results.length} tables checksummed</span>
+                <div class="flex items-center space-x-3">
+                    <span class="px-3 py-1 bg-green-500/20 text-green-400 rounded-full text-sm">${results.length - mismatches.length - errors.length} match</span>
+                    ${mismatches.length > 0 ? `<span class="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-sm">${mismatches.length} mismatch</span>` : ''}
+                    ${errors.length > 0 ? `<span class="px-3 py-1 bg-yellow-500/20 text-yellow-400 rounded-full text-sm">${errors.length} errors</span>` : ''}
+                </div>
+            </div>
+        </div>
+        ${results.map(r => `
+            <div class="bg-slate-800/50 card border ${r.error ? 'border-yellow-500/50' : (r.match ? 'border-green-500/50' : 'border-red-500/50')} rounded-lg p-4 mb-3">
+                <div class="flex items-center justify-between mb-3">
+                    <span class="font-mono font-semibold">${r.table_name}</span>
+                    ${r.error
+                        ? `<span class="px-2 py-1 bg-yellow-500/20 text-yellow-400 rounded text-xs">ERROR</span>`
+                        : (r.match
+                            ? '<span class="px-2 py-1 bg-green-500/20 text-green-400 rounded text-xs">MATCH</span>'
+                            : '<span class="px-2 py-1 bg-red-500/20 text-red-400 rounded text-xs">MISMATCH</span>')}
+                </div>
+                ${r.error ? `<p class="text-yellow-400 text-sm">${r.error}</p>` : `
+                    <div class="grid grid-cols-2 gap-4 text-sm">
+                        <div>
+                            <p class="text-slate-400 text-xs mb-1">Source (${r.source_count.toLocaleString()} rows)</p>
+                            <p class="font-mono text-xs ${r.match ? 'text-green-400' : 'text-red-400'} break-all">${r.source_checksum}</p>
+                        </div>
+                        <div>
+                            <p class="text-slate-400 text-xs mb-1">Target (${r.target_count.toLocaleString()} rows)</p>
+                            <p class="font-mono text-xs ${r.match ? 'text-green-400' : 'text-red-400'} break-all">${r.target_checksum}</p>
+                        </div>
                     </div>
-                    <div class="grid grid-cols-3 gap-4">
-                        <div><p class="text-slate-400 text-sm">Source Count</p><p class="text-2xl font-bold">${result.source_count.toLocaleString()}</p></div>
-                        <div><p class="text-slate-400 text-sm">Target Count</p><p class="text-2xl font-bold">${result.target_count.toLocaleString()}</p></div>
-                        <div><p class="text-slate-400 text-sm">Difference</p><p class="text-2xl font-bold ${result.has_discrepancy ? 'text-red-500' : 'text-green-500'}">${result.discrepancy > 0 ? '+' : ''}${result.discrepancy.toLocaleString()}</p></div>
+                `}
+            </div>
+        `).join('')}
+    `;
+}
+
+async function startBatchCheck() {
+    const useEstimate = document.getElementById('batchUseEstimate').checked;
+    const btn = document.getElementById('batchCheckBtn');
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+    btn.classList.add('opacity-50');
+
+    document.getElementById('batchProgress').classList.remove('hidden');
+    document.getElementById('batchResults').innerHTML = '';
+
+    try {
+        const response = await fetch('/api/discrepancy-check-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ use_estimate: useEstimate })
+        });
+
+        if (response.status === 409) {
+            alert('A batch check is already in progress. Please wait.');
+            btn.disabled = false;
+            btn.textContent = 'Check All Databases';
+            btn.classList.remove('opacity-50');
+            return;
+        }
+
+        const data = await response.json();
+        btn.textContent = `Checking ${data.total_databases} databases...`;
+
+        if (batchPollInterval) clearInterval(batchPollInterval);
+        batchPollInterval = setInterval(pollBatchStatus, 2000);
+    } catch (error) {
+        btn.disabled = false;
+        btn.textContent = 'Check All Databases';
+        btn.classList.remove('opacity-50');
+        alert('Error starting batch check: ' + error.message);
+    }
+}
+
+async function pollBatchStatus() {
+    try {
+        const resp = await fetch('/api/discrepancy-check-all/status');
+        const data = await resp.json();
+
+        if (data.message === 'no batch check has been started') return;
+
+        const pct = data.total_databases > 0 ? Math.round((data.completed / data.total_databases) * 100) : 0;
+        document.getElementById('batchProgressBar').style.width = pct + '%';
+        document.getElementById('batchProgressText').textContent = `${data.completed} / ${data.total_databases}`;
+
+        if (!data.in_progress) {
+            clearInterval(batchPollInterval);
+            batchPollInterval = null;
+
+            const btn = document.getElementById('batchCheckBtn');
+            btn.disabled = false;
+            btn.textContent = 'Check All Databases';
+            btn.classList.remove('opacity-50');
+
+            renderBatchResults(data);
+        }
+    } catch (error) {
+        console.error('Error polling batch status:', error);
+    }
+}
+
+function renderBatchResults(data) {
+    const results = data.results || [];
+    const withDiscrepancy = results.filter(r => r.has_discrepancy);
+    const withErrors = results.filter(r => r.error);
+    const ok = results.filter(r => !r.has_discrepancy && !r.error);
+
+    document.getElementById('batchResults').innerHTML = `
+        <div class="bg-slate-800/50 card border border-slate-700 rounded-lg p-6 mb-4">
+            <h3 class="text-lg font-semibold mb-4">Batch Check Summary</h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                <div>
+                    <p class="text-slate-400 text-sm">Total Databases</p>
+                    <p class="text-2xl font-bold">${results.length}</p>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm">In Sync</p>
+                    <p class="text-2xl font-bold text-green-400">${ok.length}</p>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm">Discrepancies</p>
+                    <p class="text-2xl font-bold text-red-400">${withDiscrepancy.length}</p>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm">Errors</p>
+                    <p class="text-2xl font-bold text-yellow-400">${withErrors.length}</p>
+                </div>
+            </div>
+            ${data.use_estimated ? '<span class="px-2 py-1 bg-yellow-500/20 text-yellow-400 text-xs rounded">Estimated counts</span>' : '<span class="px-2 py-1 bg-blue-500/20 text-blue-400 text-xs rounded">Exact counts</span>'}
+        </div>
+
+        ${results.sort((a, b) => (b.has_discrepancy ? 1 : 0) - (a.has_discrepancy ? 1 : 0)).map(db => `
+            <div class="bg-slate-800/50 card border ${db.error ? 'border-yellow-500/50' : (db.has_discrepancy ? 'border-red-500/50' : 'border-green-500/50')} rounded-lg mb-3">
+                <div class="p-4 cursor-pointer" onclick="this.nextElementSibling.classList.toggle('hidden')">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center space-x-3">
+                            <span class="w-3 h-3 rounded-full ${db.error ? 'bg-yellow-500' : (db.has_discrepancy ? 'bg-red-500' : 'bg-green-500')}"></span>
+                            <span class="font-semibold">${db.database}</span>
+                            <span class="text-xs text-slate-400">${db.source_tables} source / ${db.target_tables} target tables</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            ${db.missing_on_target && db.missing_on_target.length > 0 ? `<span class="px-2 py-1 bg-red-500/20 text-red-400 text-xs rounded">${db.missing_on_target.length} missing on target</span>` : ''}
+                            ${db.missing_on_source && db.missing_on_source.length > 0 ? `<span class="px-2 py-1 bg-yellow-500/20 text-yellow-400 text-xs rounded">${db.missing_on_source.length} extra on target</span>` : ''}
+                            ${db.error ? `<span class="px-2 py-1 bg-yellow-500/20 text-yellow-400 text-xs rounded">Error</span>` : ''}
+                            <svg class="h-4 w-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                        </div>
                     </div>
                 </div>
-            `).join('')}
-        `;
-    } catch (error) {
-        console.error('Error checking discrepancy:', error);
-        alert('Error checking discrepancy');
-    }
+                <div class="hidden border-t border-slate-700 p-4">
+                    ${db.error ? `<p class="text-yellow-400 text-sm mb-3">${db.error}</p>` : ''}
+                    ${db.missing_on_target && db.missing_on_target.length > 0 ? `
+                        <div class="mb-3">
+                            <p class="text-red-400 text-sm font-semibold mb-1">Missing on Target:</p>
+                            <div class="flex flex-wrap gap-1">${db.missing_on_target.map(t => `<span class="px-2 py-1 bg-red-500/10 text-red-400 text-xs rounded font-mono">${t}</span>`).join('')}</div>
+                        </div>
+                    ` : ''}
+                    ${db.missing_on_source && db.missing_on_source.length > 0 ? `
+                        <div class="mb-3">
+                            <p class="text-yellow-400 text-sm font-semibold mb-1">Extra on Target (not on source):</p>
+                            <div class="flex flex-wrap gap-1">${db.missing_on_source.map(t => `<span class="px-2 py-1 bg-yellow-500/10 text-yellow-400 text-xs rounded font-mono">${t}</span>`).join('')}</div>
+                        </div>
+                    ` : ''}
+                    ${db.table_results && db.table_results.length > 0 ? `
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="border-b border-slate-700">
+                                    <th class="text-left py-2 px-3 text-slate-400 font-medium text-xs">Table</th>
+                                    <th class="text-right py-2 px-3 text-slate-400 font-medium text-xs">Source</th>
+                                    <th class="text-right py-2 px-3 text-slate-400 font-medium text-xs">Target</th>
+                                    <th class="text-right py-2 px-3 text-slate-400 font-medium text-xs">Diff</th>
+                                    <th class="text-center py-2 px-3 text-slate-400 font-medium text-xs">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${db.table_results.map(t => `
+                                    <tr class="border-b border-slate-800 ${t.has_discrepancy ? 'bg-red-500/5' : ''}">
+                                        <td class="py-2 px-3 font-mono text-xs">${t.table_name}</td>
+                                        <td class="py-2 px-3 text-right font-mono text-xs">${t.source_count.toLocaleString()}</td>
+                                        <td class="py-2 px-3 text-right font-mono text-xs">${t.target_count.toLocaleString()}</td>
+                                        <td class="py-2 px-3 text-right font-mono text-xs ${t.has_discrepancy ? 'text-red-400 font-bold' : 'text-green-400'}">${t.discrepancy > 0 ? '+' : ''}${t.discrepancy.toLocaleString()}</td>
+                                        <td class="py-2 px-3 text-center">${t.has_discrepancy
+                                            ? '<span class="px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded text-xs">MISMATCH</span>'
+                                            : '<span class="px-1.5 py-0.5 bg-green-500/20 text-green-400 rounded text-xs">OK</span>'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<p class="text-slate-400 text-sm">No table comparison data available.</p>'}
+                </div>
+            </div>
+        `).join('')}
+    `;
 }

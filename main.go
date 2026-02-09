@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 type DatabaseConfig struct {
@@ -46,13 +48,13 @@ type Publication struct {
 }
 
 type Subscription struct {
-	SubName    string  `json:"subname"`
-	Owner      string  `json:"owner"`
-	Enabled    bool    `json:"enabled"`
-	Publication string `json:"publication"`
-	ConnInfo   string  `json:"conninfo"`
-	SlotName   *string `json:"slot_name"`
-	SyncCommit string  `json:"synchronous_commit"`
+	SubName     string  `json:"subname"`
+	Owner       string  `json:"owner"`
+	Enabled     bool    `json:"enabled"`
+	Publication string  `json:"publication"`
+	ConnInfo    string  `json:"conninfo"`
+	SlotName    *string `json:"slot_name"`
+	SyncCommit  string  `json:"synchronous_commit"`
 }
 
 type ReplicationStats struct {
@@ -116,9 +118,48 @@ type DiscrepancyCheck struct {
 	HasDiscrepancy bool   `json:"has_discrepancy"`
 }
 
+type TableInfo struct {
+	SchemaName string `json:"schema_name"`
+	TableName  string `json:"table_name"`
+	EstRows    int64  `json:"est_rows"`
+}
+
+type DatabaseDiscrepancy struct {
+	Database        string             `json:"database"`
+	SourceTables    int                `json:"source_tables"`
+	TargetTables    int                `json:"target_tables"`
+	MissingOnTarget []string           `json:"missing_on_target"`
+	MissingOnSource []string           `json:"missing_on_source"`
+	TableResults    []DiscrepancyCheck `json:"table_results"`
+	HasDiscrepancy  bool               `json:"has_discrepancy"`
+	Error           string             `json:"error,omitempty"`
+}
+
+type ChecksumResult struct {
+	Database       string `json:"database"`
+	TableName      string `json:"table_name"`
+	SourceChecksum string `json:"source_checksum"`
+	TargetChecksum string `json:"target_checksum"`
+	SourceCount    int64  `json:"source_count"`
+	TargetCount    int64  `json:"target_count"`
+	Match          bool   `json:"match"`
+	Error          string `json:"error,omitempty"`
+}
+
+type BatchCheckProgress struct {
+	TotalDatabases int                   `json:"total_databases"`
+	Completed      int                   `json:"completed"`
+	Results        []DatabaseDiscrepancy `json:"results"`
+	InProgress     bool                  `json:"in_progress"`
+	UseEstimated   bool                  `json:"use_estimated"`
+}
+
 var (
 	sourceDB *sql.DB
 	targetDB *sql.DB
+
+	batchCheckMu       sync.Mutex
+	batchCheckProgress *BatchCheckProgress
 )
 
 func main() {
@@ -166,6 +207,10 @@ func main() {
 	http.HandleFunc("/api/databases", getDatabases)
 	http.HandleFunc("/api/databases/details", getDatabaseDetails)
 	http.HandleFunc("/api/discrepancy-check", checkDiscrepancy)
+	http.HandleFunc("/api/tables", getTablesForDatabase)
+	http.HandleFunc("/api/discrepancy-check-all", checkDiscrepancyAll)
+	http.HandleFunc("/api/discrepancy-check-all/status", checkDiscrepancyAllStatus)
+	http.HandleFunc("/api/checksum-check", checksumCheck)
 
 	port := getEnv("SERVER_PORT", "8080")
 	log.Printf("Server starting on http://localhost:%s", port)
@@ -177,7 +222,7 @@ func main() {
 func initDB(config DatabaseConfig) (*sql.DB, error) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		config.Host, config.Port, config.User, config.Password, config.DBName, config.SSLMode)
-	
+
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, err
@@ -238,12 +283,12 @@ func countPublicationsAcrossAllDatabases() int {
 		FROM pg_replication_slots 
 		WHERE slot_type = 'logical' AND database IS NOT NULL
 	`).Scan(&count)
-	
+
 	if err != nil {
 		log.Printf("Error counting publications: %v", err)
 		return 0
 	}
-	
+
 	return count
 }
 
@@ -255,12 +300,12 @@ func countSubscriptionsAcrossAllDatabases() int {
 		FROM pg_replication_slots 
 		WHERE slot_type = 'logical' AND database IS NOT NULL
 	`).Scan(&count)
-	
+
 	if err != nil {
 		log.Printf("Error counting subscriptions: %v", err)
 		return 0
 	}
-	
+
 	return count
 }
 
@@ -296,7 +341,7 @@ func getMonitoringSummary(w http.ResponseWriter, r *http.Request) {
 			MAX(write_lag)::text
 		FROM pg_stat_replication
 	`).Scan(&maxReplayLag, &maxFlushLag, &maxWriteLag)
-	
+
 	if maxReplayLag.Valid {
 		summary.MaxReplayLag = &maxReplayLag.String
 	}
@@ -562,7 +607,7 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 			slotRows.Scan(&dbName, &total, &active)
 			slotMap[dbName] = struct{ total, active int }{total, active}
 		}
-		
+
 		// Apply slot data to details
 		for i := range details {
 			if slots, ok := slotMap[details[i].Name]; ok {
@@ -575,11 +620,11 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 	// Get publication count (global, not per-database for logical replication)
 	var pubCount int
 	sourceDB.QueryRow("SELECT COUNT(*) FROM pg_publication").Scan(&pubCount)
-	
+
 	// Get subscription count (global)
 	var subCount int
 	targetDB.QueryRow("SELECT COUNT(*) FROM pg_subscription").Scan(&subCount)
-	
+
 	// Apply to all databases that have slots
 	for i := range details {
 		if details[i].SlotCount > 0 {
@@ -594,10 +639,125 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(details)
 }
 
+func connectToDatabase(role string, dbName string) (*sql.DB, error) {
+	var host, port, user, password, sslmode string
+	if role == "source" {
+		host = getEnv("SOURCE_DB_HOST", "localhost")
+		port = getEnv("SOURCE_DB_PORT", "5432")
+		user = getEnv("SOURCE_DB_USER", "postgres")
+		password = getEnv("SOURCE_DB_PASSWORD", "")
+		sslmode = getEnv("SOURCE_DB_SSLMODE", "disable")
+	} else {
+		host = getEnv("TARGET_DB_HOST", "localhost")
+		port = getEnv("TARGET_DB_PORT", "5433")
+		user = getEnv("TARGET_DB_USER", "postgres")
+		password = getEnv("TARGET_DB_PASSWORD", "")
+		sslmode = getEnv("TARGET_DB_SSLMODE", "require")
+	}
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		host, port, user, password, dbName, sslmode)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	db.SetMaxOpenConns(3)
+	db.SetConnMaxLifetime(2 * time.Minute)
+	return db, nil
+}
+
+func safeTableName(schema, table string) string {
+	if schema != "" && schema != "public" {
+		return pq.QuoteIdentifier(schema) + "." + pq.QuoteIdentifier(table)
+	}
+	return pq.QuoteIdentifier(table)
+}
+
+func discoverTables(db *sql.DB) ([]TableInfo, error) {
+	rows, err := db.Query(`
+		SELECT 
+			schemaname,
+			relname,
+			COALESCE(n_live_tup, 0)
+		FROM pg_stat_user_tables
+		ORDER BY schemaname, relname
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tables []TableInfo
+	for rows.Next() {
+		var t TableInfo
+		if err := rows.Scan(&t.SchemaName, &t.TableName, &t.EstRows); err != nil {
+			continue
+		}
+		tables = append(tables, t)
+	}
+	return tables, nil
+}
+
+func getTablesForDatabase(w http.ResponseWriter, r *http.Request) {
+	dbName := r.URL.Query().Get("database")
+	if dbName == "" {
+		http.Error(w, "database parameter required", http.StatusBadRequest)
+		return
+	}
+
+	type TablesResponse struct {
+		Database     string      `json:"database"`
+		SourceTables []TableInfo `json:"source_tables"`
+		TargetTables []TableInfo `json:"target_tables"`
+		Error        string      `json:"error,omitempty"`
+	}
+
+	resp := TablesResponse{Database: dbName}
+
+	sourceConn, err := connectToDatabase("source", dbName)
+	if err != nil {
+		resp.Error = fmt.Sprintf("source connection error: %v", err)
+	} else {
+		defer sourceConn.Close()
+		tables, err := discoverTables(sourceConn)
+		if err != nil {
+			resp.Error = fmt.Sprintf("source table discovery error: %v", err)
+		} else {
+			resp.SourceTables = tables
+		}
+	}
+
+	targetConn, err := connectToDatabase("target", dbName)
+	if err != nil {
+		if resp.Error != "" {
+			resp.Error += "; "
+		}
+		resp.Error += fmt.Sprintf("target connection error: %v", err)
+	} else {
+		defer targetConn.Close()
+		tables, err := discoverTables(targetConn)
+		if err != nil {
+			if resp.Error != "" {
+				resp.Error += "; "
+			}
+			resp.Error += fmt.Sprintf("target table discovery error: %v", err)
+		} else {
+			resp.TargetTables = tables
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 func checkDiscrepancy(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Database string   `json:"database"`
-		Tables   []string `json:"tables"`
+		Database    string   `json:"database"`
+		Tables      []string `json:"tables"`
+		UseEstimate bool     `json:"use_estimate"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -605,37 +765,39 @@ func checkDiscrepancy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sourceConn, err := connectToDatabase("source", request.Database)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("source connection error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer sourceConn.Close()
+
+	targetConn, err := connectToDatabase("target", request.Database)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("target connection error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer targetConn.Close()
+
 	var results []DiscrepancyCheck
 
 	for _, table := range request.Tables {
 		var sourceCount, targetCount int64
-
-		sourceConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-			getEnv("SOURCE_DB_HOST", "localhost"),
-			getEnv("SOURCE_DB_PORT", "5432"),
-			getEnv("SOURCE_DB_USER", "postgres"),
-			getEnv("SOURCE_DB_PASSWORD", ""),
-			request.Database,
-			getEnv("SOURCE_DB_SSLMODE", "disable"))
-		
-		sourceConn, err := sql.Open("postgres", sourceConnStr)
-		if err == nil {
-			defer sourceConn.Close()
-			sourceConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&sourceCount)
+		parts := strings.SplitN(table, ".", 2)
+		schema := "public"
+		tableName := table
+		if len(parts) == 2 {
+			schema = parts[0]
+			tableName = parts[1]
 		}
+		safeName := safeTableName(schema, tableName)
 
-		targetConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-			getEnv("TARGET_DB_HOST", "localhost"),
-			getEnv("TARGET_DB_PORT", "5433"),
-			getEnv("TARGET_DB_USER", "postgres"),
-			getEnv("TARGET_DB_PASSWORD", ""),
-			request.Database,
-			getEnv("TARGET_DB_SSLMODE", "require"))
-		
-		targetConn, err := sql.Open("postgres", targetConnStr)
-		if err == nil {
-			defer targetConn.Close()
-			targetConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&targetCount)
+		if request.UseEstimate {
+			sourceConn.QueryRow(`SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = $2`, schema, tableName).Scan(&sourceCount)
+			targetConn.QueryRow(`SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = $2`, schema, tableName).Scan(&targetCount)
+		} else {
+			sourceConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", safeName)).Scan(&sourceCount)
+			targetConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", safeName)).Scan(&targetCount)
 		}
 
 		discrepancy := sourceCount - targetCount
@@ -647,6 +809,288 @@ func checkDiscrepancy(w http.ResponseWriter, r *http.Request) {
 			Discrepancy:    discrepancy,
 			HasDiscrepancy: discrepancy != 0,
 		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func checkSingleDatabase(dbName string, useEstimate bool) DatabaseDiscrepancy {
+	result := DatabaseDiscrepancy{Database: dbName}
+
+	sourceConn, err := connectToDatabase("source", dbName)
+	if err != nil {
+		result.Error = fmt.Sprintf("source: %v", err)
+		result.HasDiscrepancy = true
+		return result
+	}
+	defer sourceConn.Close()
+
+	targetConn, err := connectToDatabase("target", dbName)
+	if err != nil {
+		result.Error = fmt.Sprintf("target: %v", err)
+		result.HasDiscrepancy = true
+		return result
+	}
+	defer targetConn.Close()
+
+	sourceTables, err := discoverTables(sourceConn)
+	if err != nil {
+		result.Error = fmt.Sprintf("discover source tables: %v", err)
+		result.HasDiscrepancy = true
+		return result
+	}
+	result.SourceTables = len(sourceTables)
+
+	targetTables, err := discoverTables(targetConn)
+	if err != nil {
+		result.Error = fmt.Sprintf("discover target tables: %v", err)
+		result.HasDiscrepancy = true
+		return result
+	}
+	result.TargetTables = len(targetTables)
+
+	sourceMap := make(map[string]TableInfo)
+	for _, t := range sourceTables {
+		key := t.SchemaName + "." + t.TableName
+		sourceMap[key] = t
+	}
+	targetMap := make(map[string]TableInfo)
+	for _, t := range targetTables {
+		key := t.SchemaName + "." + t.TableName
+		targetMap[key] = t
+	}
+
+	for key := range sourceMap {
+		if _, ok := targetMap[key]; !ok {
+			result.MissingOnTarget = append(result.MissingOnTarget, key)
+			result.HasDiscrepancy = true
+		}
+	}
+	for key := range targetMap {
+		if _, ok := sourceMap[key]; !ok {
+			result.MissingOnSource = append(result.MissingOnSource, key)
+			result.HasDiscrepancy = true
+		}
+	}
+
+	for key, srcTable := range sourceMap {
+		if _, ok := targetMap[key]; !ok {
+			continue
+		}
+		var sourceCount, targetCount int64
+		safeName := safeTableName(srcTable.SchemaName, srcTable.TableName)
+
+		if useEstimate {
+			sourceConn.QueryRow(`SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = $2`,
+				srcTable.SchemaName, srcTable.TableName).Scan(&sourceCount)
+			targetConn.QueryRow(`SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = $2`,
+				srcTable.SchemaName, srcTable.TableName).Scan(&targetCount)
+		} else {
+			sourceConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", safeName)).Scan(&sourceCount)
+			targetConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", safeName)).Scan(&targetCount)
+		}
+
+		discrepancy := sourceCount - targetCount
+		check := DiscrepancyCheck{
+			Database:       dbName,
+			TableName:      key,
+			SourceCount:    sourceCount,
+			TargetCount:    targetCount,
+			Discrepancy:    discrepancy,
+			HasDiscrepancy: discrepancy != 0,
+		}
+		result.TableResults = append(result.TableResults, check)
+		if discrepancy != 0 {
+			result.HasDiscrepancy = true
+		}
+	}
+
+	return result
+}
+
+func checkDiscrepancyAll(w http.ResponseWriter, r *http.Request) {
+	batchCheckMu.Lock()
+	if batchCheckProgress != nil && batchCheckProgress.InProgress {
+		batchCheckMu.Unlock()
+		http.Error(w, "batch check already in progress", http.StatusConflict)
+		return
+	}
+
+	var request struct {
+		UseEstimate bool `json:"use_estimate"`
+	}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&request)
+	}
+
+	// Get databases with active replication slots
+	rows, err := sourceDB.Query(`
+		SELECT DISTINCT database 
+		FROM pg_replication_slots 
+		WHERE slot_type = 'logical' AND database IS NOT NULL
+		ORDER BY database
+	`)
+	if err != nil {
+		batchCheckMu.Unlock()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var dbName string
+		rows.Scan(&dbName)
+		databases = append(databases, dbName)
+	}
+
+	batchCheckProgress = &BatchCheckProgress{
+		TotalDatabases: len(databases),
+		Completed:      0,
+		Results:        make([]DatabaseDiscrepancy, 0),
+		InProgress:     true,
+		UseEstimated:   request.UseEstimate,
+	}
+	batchCheckMu.Unlock()
+
+	// Run in background with concurrency limit
+	go func() {
+		sem := make(chan struct{}, 4)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		for _, dbName := range databases {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(db string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				result := checkSingleDatabase(db, request.UseEstimate)
+
+				mu.Lock()
+				batchCheckMu.Lock()
+				batchCheckProgress.Results = append(batchCheckProgress.Results, result)
+				batchCheckProgress.Completed++
+				batchCheckMu.Unlock()
+				mu.Unlock()
+			}(dbName)
+		}
+
+		wg.Wait()
+		batchCheckMu.Lock()
+		batchCheckProgress.InProgress = false
+		batchCheckMu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":         "batch check started",
+		"total_databases": len(databases),
+		"databases":       databases,
+	})
+}
+
+func checkDiscrepancyAllStatus(w http.ResponseWriter, r *http.Request) {
+	batchCheckMu.Lock()
+	defer batchCheckMu.Unlock()
+
+	if batchCheckProgress == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "no batch check has been started",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(batchCheckProgress)
+}
+
+func checksumCheck(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Database string   `json:"database"`
+		Tables   []string `json:"tables"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	sourceConn, err := connectToDatabase("source", request.Database)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("source connection error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer sourceConn.Close()
+
+	targetConn, err := connectToDatabase("target", request.Database)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("target connection error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer targetConn.Close()
+
+	var results []ChecksumResult
+
+	for _, table := range request.Tables {
+		cr := ChecksumResult{Database: request.Database, TableName: table}
+
+		parts := strings.SplitN(table, ".", 2)
+		schema := "public"
+		tableName := table
+		if len(parts) == 2 {
+			schema = parts[0]
+			tableName = parts[1]
+		}
+		safeName := safeTableName(schema, tableName)
+
+		// Get primary key column for ordering
+		var pkColumn string
+		sourceConn.QueryRow(`
+			SELECT a.attname
+			FROM pg_index i
+			JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+			WHERE i.indrelid = $1::regclass AND i.indisprimary
+			LIMIT 1
+		`, safeName).Scan(&pkColumn)
+
+		var orderClause string
+		if pkColumn != "" {
+			orderClause = fmt.Sprintf("ORDER BY %s", pq.QuoteIdentifier(pkColumn))
+		} else {
+			orderClause = "ORDER BY ctid"
+		}
+
+		checksumQuery := fmt.Sprintf(
+			`SELECT COALESCE(md5(string_agg(t::text, '' %s)), 'empty'), COUNT(*) FROM (SELECT * FROM %s) t`,
+			orderClause, safeName,
+		)
+
+		var sourceChecksum string
+		var sourceCount int64
+		if err := sourceConn.QueryRow(checksumQuery).Scan(&sourceChecksum, &sourceCount); err != nil {
+			cr.Error = fmt.Sprintf("source checksum error: %v", err)
+			results = append(results, cr)
+			continue
+		}
+		cr.SourceChecksum = sourceChecksum
+		cr.SourceCount = sourceCount
+
+		var targetChecksum string
+		var targetCount int64
+		if err := targetConn.QueryRow(checksumQuery).Scan(&targetChecksum, &targetCount); err != nil {
+			cr.Error = fmt.Sprintf("target checksum error: %v", err)
+			results = append(results, cr)
+			continue
+		}
+		cr.TargetChecksum = targetChecksum
+		cr.TargetCount = targetCount
+
+		cr.Match = sourceChecksum == targetChecksum
+		results = append(results, cr)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
