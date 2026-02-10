@@ -23,15 +23,17 @@ type DatabaseConfig struct {
 }
 
 type ReplicationSlot struct {
-	SlotName     string  `json:"slot_name"`
-	Plugin       string  `json:"plugin"`
-	SlotType     string  `json:"slot_type"`
-	Database     string  `json:"database"`
-	Active       bool    `json:"active"`
-	RestartLSN   *string `json:"restart_lsn"`
-	ConfirmedLSN *string `json:"confirmed_flush_lsn"`
-	WALStatus    string  `json:"wal_status"`
-	SafeWALSize  *int64  `json:"safe_wal_size"`
+	SlotName      string  `json:"slot_name"`
+	Plugin        string  `json:"plugin"`
+	SlotType      string  `json:"slot_type"`
+	Database      string  `json:"database"`
+	Active        bool    `json:"active"`
+	RestartLSN    *string `json:"restart_lsn"`
+	ConfirmedLSN  *string `json:"confirmed_flush_lsn"`
+	WALStatus     string  `json:"wal_status"`
+	SafeWALSize   *int64  `json:"safe_wal_size"`
+	CurrentWALLSN *string `json:"current_wal_lsn"`
+	LSNDistance   *int64  `json:"lsn_distance"`
 }
 
 type Publication struct {
@@ -46,13 +48,13 @@ type Publication struct {
 }
 
 type Subscription struct {
-	SubName    string  `json:"subname"`
-	Owner      string  `json:"owner"`
-	Enabled    bool    `json:"enabled"`
-	Publication string `json:"publication"`
-	ConnInfo   string  `json:"conninfo"`
-	SlotName   *string `json:"slot_name"`
-	SyncCommit string  `json:"synchronous_commit"`
+	SubName     string  `json:"subname"`
+	Owner       string  `json:"owner"`
+	Enabled     bool    `json:"enabled"`
+	Publication string  `json:"publication"`
+	ConnInfo    string  `json:"conninfo"`
+	SlotName    *string `json:"slot_name"`
+	SyncCommit  string  `json:"synchronous_commit"`
 }
 
 type ReplicationStats struct {
@@ -108,12 +110,15 @@ type MonitoringSummary struct {
 }
 
 type DiscrepancyCheck struct {
-	Database       string `json:"database"`
-	TableName      string `json:"table_name"`
-	SourceCount    int64  `json:"source_count"`
-	TargetCount    int64  `json:"target_count"`
-	Discrepancy    int64  `json:"discrepancy"`
-	HasDiscrepancy bool   `json:"has_discrepancy"`
+	Database        string `json:"database"`
+	TableName       string `json:"table_name"`
+	SourceCount     int64  `json:"source_count"`
+	TargetCount     int64  `json:"target_count"`
+	Discrepancy     int64  `json:"discrepancy"`
+	HasDiscrepancy  bool   `json:"has_discrepancy"`
+	TimestampColumn string `json:"timestamp_column,omitempty"`
+	CheckedFrom     string `json:"checked_from,omitempty"`
+	CheckedTo       string `json:"checked_to,omitempty"`
 }
 
 var (
@@ -177,7 +182,7 @@ func main() {
 func initDB(config DatabaseConfig) (*sql.DB, error) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		config.Host, config.Port, config.User, config.Password, config.DBName, config.SSLMode)
-	
+
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, err
@@ -201,15 +206,23 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+func noCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+}
+
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
+	noCacheHeaders(w)
 	http.ServeFile(w, r, "index.html")
 }
 
 func serveStatic(w http.ResponseWriter, r *http.Request) {
+	noCacheHeaders(w)
 	http.StripPrefix("/static/", http.FileServer(http.Dir("static"))).ServeHTTP(w, r)
 }
 
@@ -238,12 +251,12 @@ func countPublicationsAcrossAllDatabases() int {
 		FROM pg_replication_slots 
 		WHERE slot_type = 'logical' AND database IS NOT NULL
 	`).Scan(&count)
-	
+
 	if err != nil {
 		log.Printf("Error counting publications: %v", err)
 		return 0
 	}
-	
+
 	return count
 }
 
@@ -255,12 +268,12 @@ func countSubscriptionsAcrossAllDatabases() int {
 		FROM pg_replication_slots 
 		WHERE slot_type = 'logical' AND database IS NOT NULL
 	`).Scan(&count)
-	
+
 	if err != nil {
 		log.Printf("Error counting subscriptions: %v", err)
 		return 0
 	}
-	
+
 	return count
 }
 
@@ -296,7 +309,7 @@ func getMonitoringSummary(w http.ResponseWriter, r *http.Request) {
 			MAX(write_lag)::text
 		FROM pg_stat_replication
 	`).Scan(&maxReplayLag, &maxFlushLag, &maxWriteLag)
-	
+
 	if maxReplayLag.Valid {
 		summary.MaxReplayLag = &maxReplayLag.String
 	}
@@ -438,7 +451,12 @@ func getReplicationSlots(w http.ResponseWriter, r *http.Request) {
 			restart_lsn::text,
 			confirmed_flush_lsn::text,
 			wal_status,
-			safe_wal_size
+			safe_wal_size,
+			pg_current_wal_lsn()::text,
+			CASE WHEN confirmed_flush_lsn IS NOT NULL 
+				THEN (pg_current_wal_lsn() - confirmed_flush_lsn)::bigint 
+				ELSE NULL 
+			END AS lsn_distance
 		FROM pg_replication_slots
 		ORDER BY slot_name
 	`)
@@ -451,7 +469,7 @@ func getReplicationSlots(w http.ResponseWriter, r *http.Request) {
 	var slots []ReplicationSlot
 	for rows.Next() {
 		var slot ReplicationSlot
-		rows.Scan(&slot.SlotName, &slot.Plugin, &slot.SlotType, &slot.Database, &slot.Active, &slot.RestartLSN, &slot.ConfirmedLSN, &slot.WALStatus, &slot.SafeWALSize)
+		rows.Scan(&slot.SlotName, &slot.Plugin, &slot.SlotType, &slot.Database, &slot.Active, &slot.RestartLSN, &slot.ConfirmedLSN, &slot.WALStatus, &slot.SafeWALSize, &slot.CurrentWALLSN, &slot.LSNDistance)
 		slots = append(slots, slot)
 	}
 
@@ -562,7 +580,7 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 			slotRows.Scan(&dbName, &total, &active)
 			slotMap[dbName] = struct{ total, active int }{total, active}
 		}
-		
+
 		// Apply slot data to details
 		for i := range details {
 			if slots, ok := slotMap[details[i].Name]; ok {
@@ -575,11 +593,11 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 	// Get publication count (global, not per-database for logical replication)
 	var pubCount int
 	sourceDB.QueryRow("SELECT COUNT(*) FROM pg_publication").Scan(&pubCount)
-	
+
 	// Get subscription count (global)
 	var subCount int
 	targetDB.QueryRow("SELECT COUNT(*) FROM pg_subscription").Scan(&subCount)
-	
+
 	// Apply to all databases that have slots
 	for i := range details {
 		if details[i].SlotCount > 0 {
@@ -596,8 +614,11 @@ func getDatabaseDetails(w http.ResponseWriter, r *http.Request) {
 
 func checkDiscrepancy(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Database string   `json:"database"`
-		Tables   []string `json:"tables"`
+		Database        string   `json:"database"`
+		Tables          []string `json:"tables"`
+		TimestampColumn string   `json:"timestamp_column"`
+		StartTime       string   `json:"start_time"`
+		EndTime         string   `json:"end_time"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -605,50 +626,74 @@ func checkDiscrepancy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sourceConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		getEnv("SOURCE_DB_HOST", "localhost"),
+		getEnv("SOURCE_DB_PORT", "5432"),
+		getEnv("SOURCE_DB_USER", "postgres"),
+		getEnv("SOURCE_DB_PASSWORD", ""),
+		request.Database,
+		getEnv("SOURCE_DB_SSLMODE", "disable"))
+
+	targetConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		getEnv("TARGET_DB_HOST", "localhost"),
+		getEnv("TARGET_DB_PORT", "5433"),
+		getEnv("TARGET_DB_USER", "postgres"),
+		getEnv("TARGET_DB_PASSWORD", ""),
+		request.Database,
+		getEnv("TARGET_DB_SSLMODE", "require"))
+
+	sourceConn, err := sql.Open("postgres", sourceConnStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect to source: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer sourceConn.Close()
+	sourceConn.SetMaxOpenConns(1)
+	sourceConn.SetMaxIdleConns(0)
+
+	targetConn, err := sql.Open("postgres", targetConnStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect to target: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer targetConn.Close()
+	targetConn.SetMaxOpenConns(1)
+	targetConn.SetMaxIdleConns(0)
+
 	var results []DiscrepancyCheck
 
 	for _, table := range request.Tables {
 		var sourceCount, targetCount int64
 
-		sourceConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-			getEnv("SOURCE_DB_HOST", "localhost"),
-			getEnv("SOURCE_DB_PORT", "5432"),
-			getEnv("SOURCE_DB_USER", "postgres"),
-			getEnv("SOURCE_DB_PASSWORD", ""),
-			request.Database,
-			getEnv("SOURCE_DB_SSLMODE", "disable"))
-		
-		sourceConn, err := sql.Open("postgres", sourceConnStr)
-		if err == nil {
-			defer sourceConn.Close()
-			sourceConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&sourceCount)
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+		var queryArgs []interface{}
+		if request.TimestampColumn != "" && request.StartTime != "" && request.EndTime != "" {
+			query = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s BETWEEN $1 AND $2",
+				table, request.TimestampColumn)
+			queryArgs = append(queryArgs, request.StartTime, request.EndTime)
 		}
 
-		targetConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-			getEnv("TARGET_DB_HOST", "localhost"),
-			getEnv("TARGET_DB_PORT", "5433"),
-			getEnv("TARGET_DB_USER", "postgres"),
-			getEnv("TARGET_DB_PASSWORD", ""),
-			request.Database,
-			getEnv("TARGET_DB_SSLMODE", "require"))
-		
-		targetConn, err := sql.Open("postgres", targetConnStr)
-		if err == nil {
-			defer targetConn.Close()
-			targetConn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&targetCount)
-		}
+		sourceConn.QueryRow(query, queryArgs...).Scan(&sourceCount)
+		targetConn.QueryRow(query, queryArgs...).Scan(&targetCount)
 
 		discrepancy := sourceCount - targetCount
-		results = append(results, DiscrepancyCheck{
+		result := DiscrepancyCheck{
 			Database:       request.Database,
 			TableName:      table,
 			SourceCount:    sourceCount,
 			TargetCount:    targetCount,
 			Discrepancy:    discrepancy,
 			HasDiscrepancy: discrepancy != 0,
-		})
+		}
+		if request.TimestampColumn != "" {
+			result.TimestampColumn = request.TimestampColumn
+			result.CheckedFrom = request.StartTime
+			result.CheckedTo = request.EndTime
+		}
+		results = append(results, result)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	json.NewEncoder(w).Encode(results)
 }

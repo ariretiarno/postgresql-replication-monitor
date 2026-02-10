@@ -364,11 +364,24 @@ async function loadReplicationSlots() {
                                 <span class="px-3 py-1 rounded-full text-sm ${slot.active ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}">${slot.active ? 'Active' : 'Inactive'}</span>
                             </div>
                         </div>
-                        <div class="grid grid-cols-4 gap-4">
+                        <div class="grid grid-cols-5 gap-4 mb-4">
                             <div><p class="text-slate-400 text-sm">Database</p><p class="font-medium">${slot.database}</p></div>
                             <div><p class="text-slate-400 text-sm">Restart LSN</p><p class="font-mono text-sm">${slot.restart_lsn || 'N/A'}</p></div>
                             <div><p class="text-slate-400 text-sm">Confirmed LSN</p><p class="font-mono text-sm">${slot.confirmed_flush_lsn || 'N/A'}</p></div>
+                            <div><p class="text-slate-400 text-sm">Current WAL LSN</p><p class="font-mono text-sm">${slot.current_wal_lsn || 'N/A'}</p></div>
                             <div><p class="text-slate-400 text-sm">Safe WAL Size</p><p class="font-mono text-sm">${formatBytes(slot.safe_wal_size)}</p></div>
+                        </div>
+                        <div class="pt-3 border-t border-slate-700">
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <p class="text-slate-400 text-sm">LSN Distance</p>
+                                    <p class="font-mono text-lg font-bold ${slot.lsn_distance == null ? 'text-slate-500' : slot.lsn_distance === 0 ? 'text-green-400' : slot.lsn_distance < 1048576 ? 'text-yellow-400' : 'text-red-400'}">${slot.lsn_distance != null ? formatBytes(slot.lsn_distance) : 'N/A'}</p>
+                                </div>
+                                <div class="text-right">
+                                    <p class="text-slate-400 text-sm">Raw Distance</p>
+                                    <p class="font-mono text-sm">${slot.lsn_distance != null ? slot.lsn_distance.toLocaleString() + ' bytes' : 'N/A'}</p>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 `).join('')}
@@ -487,6 +500,27 @@ async function loadDiscrepancyCheck() {
                             <input type="text" id="tableInput" placeholder="e.g., users, orders, products" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
                             <p class="text-slate-400 text-sm mt-1">Enter table names separated by commas</p>
                         </div>
+                        <div class="border-t border-slate-600 pt-4 mt-2">
+                            <div class="flex items-center justify-between mb-3">
+                                <label class="block text-sm font-medium">Timestamp Filter (optional)</label>
+                                <span class="text-xs text-slate-400">Limits COUNT query to a time range for better performance</span>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">Timestamp Column</label>
+                                    <input type="text" id="timestampColumn" placeholder="e.g., created_at" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">Start Time</label>
+                                    <input type="datetime-local" id="startTime" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-1">End Time</label>
+                                    <input type="datetime-local" id="endTime" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2">
+                                </div>
+                            </div>
+                            <p class="text-slate-400 text-xs mt-2">If provided, query becomes: SELECT COUNT(*) FROM table WHERE column >= start AND column <= end</p>
+                        </div>
                         <button onclick="checkDiscrepancy()" class="w-full px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg">Check Discrepancy</button>
                     </div>
                 </div>
@@ -508,12 +542,35 @@ async function checkDiscrepancy() {
     }
 
     const tableList = tables.split(',').map(t => t.trim()).filter(t => t);
+    const timestampColumn = document.getElementById('timestampColumn').value.trim();
+    const startTime = document.getElementById('startTime').value;
+    const endTime = document.getElementById('endTime').value;
+
+    if (timestampColumn && (!startTime || !endTime)) {
+        alert('Please provide both Start Time and End Time when using a timestamp filter');
+        return;
+    }
+
+    function toTimezoneString(datetimeLocalValue) {
+        const d = new Date(datetimeLocalValue);
+        const offset = -d.getTimezoneOffset();
+        const sign = offset >= 0 ? '+' : '-';
+        const hh = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+        const mm = String(Math.abs(offset) % 60).padStart(2, '0');
+        return datetimeLocalValue.replace('T', ' ') + sign + hh + ':' + mm;
+    }
     
     try {
+        const body = { database, tables: tableList };
+        if (timestampColumn && startTime && endTime) {
+            body.timestamp_column = timestampColumn;
+            body.start_time = toTimezoneString(startTime);
+            body.end_time = toTimezoneString(endTime);
+        }
         const response = await fetch('/api/discrepancy-check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ database, tables: tableList })
+            body: JSON.stringify(body)
         });
         const results = await response.json();
         
@@ -525,6 +582,12 @@ async function checkDiscrepancy() {
                         <div><h4 class="text-lg font-semibold">${result.table_name}</h4><p class="text-sm text-slate-400">${result.database}</p></div>
                         ${result.has_discrepancy ? '<span class="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-sm">Discrepancy Found</span>' : '<span class="px-3 py-1 bg-green-500/20 text-green-400 rounded-full text-sm">In Sync</span>'}
                     </div>
+                    ${result.checked_from ? `
+                    <div class="mb-4 px-3 py-2 bg-slate-900/50 rounded-lg text-sm">
+                        <span class="text-slate-400">Filtered by</span> <span class="text-blue-400 font-mono">${result.timestamp_column}</span>
+                        <span class="text-slate-400">from</span> <span class="text-white">${result.checked_from}</span>
+                        <span class="text-slate-400">to</span> <span class="text-white">${result.checked_to}</span>
+                    </div>` : `<div class="mb-4 px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-sm text-yellow-400">Full table count (no timestamp filter)</div>`}
                     <div class="grid grid-cols-3 gap-4">
                         <div><p class="text-slate-400 text-sm">Source Count</p><p class="text-2xl font-bold">${result.source_count.toLocaleString()}</p></div>
                         <div><p class="text-slate-400 text-sm">Target Count</p><p class="text-2xl font-bold">${result.target_count.toLocaleString()}</p></div>
